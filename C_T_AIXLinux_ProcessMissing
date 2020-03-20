@@ -1,1 +1,43 @@
-
+| inputlookup C_T_AIXLinux_Processes_actual.csv WHERE Enabled = True 
+| rename user AS user_Lookup_Filter, app AS app_Lookup_Filter 
+| join max=0 type=left host, COMMAND 
+    [ search index=itops_ntd sourcetype=ps 
+        [ inputlookup C_T_AIXLinux_Processes_actual.csv 
+        | fields host 
+        | dedup host 
+        | mvcombine host 
+        | format ] 
+        [ inputlookup C_T_AIXLinux_Processes_actual.csv 
+        | fields COMMAND 
+        | dedup COMMAND, 
+        | mvcombine COMMAND 
+        | format ] 
+    | fields host, app, COMMAND, user, PID 
+    | dedup host, app, COMMAND, user, PID, sortby - _time 
+    | appendpipe 
+        [| stats max(_time) as avg_time BY host ] 
+    | sort 0 - avg_time, host 
+    | filldown avg_time 
+    | where isnotnull(_time) AND (_time - avg_time) > -1
+        ] 
+| table host, app, COMMAND, user, *_Lookup_Filter, *Threshold, PID 
+| eval user_Lookup_Filter=case(isnull(user_Lookup_Filter),"%",user_Lookup_Filter="","%",user_Lookup_Filter="*","%",1=1,user_Lookup_Filter), Expected_Matched_Filters=0 
+| foreach *_Lookup_Filter 
+    [ eval <<MATCHSEG1>>_Filter_Result = if(like('<<MATCHSEG1>>','<<FIELD>>'),1,0)] 
+| foreach *_Result 
+    [ eval Expected_Matched_Filters = Expected_Matched_Filters + 1] 
+| addtotals *Result 
+| rename Total AS Matched_Filters 
+| table *Result, *Filter*, *_, user, app, * 
+| stats sum(eval(if(Matched_Filters < Expected_Matched_Filters, 0, 1))) AS Instances, max(*_Threshold) AS *_Threshold, max(*_Lookup_Filter) AS *_Lookup_Filter BY host, COMMAND, user_Lookup_Filter, app_Lookup_Filter 
+| eval message=case(Instances<Min_Count_Threshold AND Instances>0,"The process count (".Instances.") for ".COMMAND." process does not meet the Minimum count (".Min_Count_Threshold.") running on server ".host,
+    Instances > Max_Count_Threshold,"The process count (".Instances.") for the ".COMMAND." process exceeds the Max limit (".Max_Count_Threshold.") running on server ".host,
+    Instances=0 OR isnull(Instances) OR Result=0,"Process (".COMMAND.") with Argument (".app_Lookup_Filter.") for user (".user_Lookup_Filter.") on host (".host.") is NOT Running!",1=1,"OK") 
+| eval Description="Host: ".host." Process: ".COMMAND." User: ".user_Lookup_Filter." Arguments: ".app_Lookup_Filter 
+| eval episode_title=if(COMMAND=="splunkd", "POSSIBLY FORWARDER DOWN! for ".host."", "AIX Linux Process Missing for ".host."")
+| eval hostname=host 
+| where NOT message="OK" 
+| addinfo 
+| rename info_max_time as _time 
+| fields - info* 
+| fields host, hostname, _time, message, app, COMMAND, user, *_Lookup_Filter, *_Threshold, Description, episode_title
